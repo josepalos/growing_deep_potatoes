@@ -29,16 +29,17 @@ WIDTH = 32
 HEIGHT = 32
 CHANNELS = 16
 BATCH_SIZE = 8
-STEPS_TO_SHOW = 100
+STEPS_TO_SHOW = 500
+STEPS_TO_LOG = 100
 
 
 class GrowingNet(nn.Module):
     def __init__(self):
         super(GrowingNet, self).__init__()
         self.perception_filters = torch.stack([
-            SOBEL_X,
-            SOBEL_Y,
-            CELL_IDENTITY
+            SOBEL_X.view(1, 1, *SOBEL_X.shape).repeat(CHANNELS, 1, 1, 1),
+            SOBEL_Y.view(1, 1, *SOBEL_Y.shape).repeat(CHANNELS, 1, 1, 1),
+            CELL_IDENTITY.view(1, 1, *CELL_IDENTITY.shape).repeat(CHANNELS, 1, 1, 1)
         ]).to(device)
 
         self.dense_128 = nn.Conv2d(CHANNELS * self.perception_filters.shape[0],
@@ -81,10 +82,8 @@ class GrowingNet(nn.Module):
             start = i * CHANNELS
             end = (i + 1) * CHANNELS
 
-            convolution = perception_filter.view(1, 1, *perception_filter.shape)\
-                .repeat(1, CHANNELS, 1, 1)
-
-            perception = F.conv2d(state_grid, weight=convolution, padding=1)
+            convolution = perception_filter
+            perception = F.conv2d(state_grid, weight=convolution, padding=1, groups=CHANNELS)
             perception_result[:, start:end, :, :] = perception
 
         return perception_result
@@ -120,7 +119,8 @@ def load_image_as_tensor(path):
 
 def main():
     tensor2pil = torchvision.transforms.ToPILImage()
-    target = load_image_as_tensor("sprites/potato32x32.png")
+    target = load_image_as_tensor("sprites/potato32x32_transparent.png")
+    target_batch = target.repeat(BATCH_SIZE, 1, 1, 1)  # same target for the entire batch
 
     net = GrowingNet()
     net.to(device)
@@ -129,28 +129,30 @@ def main():
     optimizer = optim.Adam(net.parameters(), lr=2e-3)
     scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=2000, gamma=0.1)
 
+    for p in net.parameters():
+        p.register_hook(lambda grad: grad / (torch.norm(grad, 2) + 1e-8))
+
     plt.ion()
 
     running_loss = 0.
+    grid = None
     for step in tqdm.trange(10001):
         grid = get_initial_grid().repeat(BATCH_SIZE, 1, 1, 1)
-        target_batch = target.repeat(BATCH_SIZE, 1, 1, 1)  # same target for the entire batch
 
         iter_n = torch.randint(64, 96, [1]).item()
 
-        optimizer.zero_grad()
         for i in range(iter_n):
             grid = net.forward(grid)
 
-            # if (step + 1) % STEPS_TO_SHOW == 0:
-            #     alive_mask = GrowingNet.get_alive_mask(grid[:1])
-            #     alive_count = torch.sum(alive_mask).item()
-            #     img = tensor2pil(grid[0, :4, :, :].cpu())
-            #     plt.imshow(np.array(img))
-            #     plt.title(f"Step {step}, iteration {i} ({alive_count} cells alive)")
-            #     plt.draw()
-            #     plt.pause(0.0001)
+            if (step + 1) % STEPS_TO_SHOW == 0:
+                img = tensor2pil(grid[0, :4, :, :].cpu())
+                plt.clf()
+                plt.imshow(np.array(img))
+                plt.title(f"Step {step}, iteration {i}")
+                plt.draw()
+                plt.pause(0.000001)
 
+        optimizer.zero_grad()
         loss = loss_f(grid[:, :4, :, :], target_batch)
         loss.backward()
         optimizer.step()
@@ -158,9 +160,24 @@ def main():
 
         running_loss += loss.item()
 
-        if (step+1) % STEPS_TO_SHOW == 0:
+        if (step+1) % STEPS_TO_LOG == 0:
             print(f'\n\tStep {step + 1:5d} mean loss: {running_loss / STEPS_TO_SHOW :.5f}')
             running_loss = 0.0
+
+    print(f'\n\tEnd mean loss: {running_loss / STEPS_TO_SHOW :.5f}')
+
+    iter_n = torch.randint(64, 96, [1]).item()
+
+    for i in range(iter_n):
+        grid = net.forward(grid)
+        img = tensor2pil(grid[0, :4, :, :].cpu())
+        plt.clf()
+        plt.imshow(np.array(img))
+        plt.title(f"Last potato, iteration {i}")
+        plt.draw()
+        plt.pause(0.0001)
+
+    plt.waitforbuttonpress()
     plt.ioff()
 
 
