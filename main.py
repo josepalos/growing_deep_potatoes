@@ -2,75 +2,96 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
-import torchvision
-import torchvision.transforms as transforms
-
-
-class Net(nn.Module):
-    def __init__(self):
-        super(Net, self).__init__()
-        self.conv1 = nn.Conv2d(3, 6, 5)
-        self.pool = nn.MaxPool2d(2, 2)
-        self.conv2 = nn.Conv2d(6, 16, 5)
-        self.fc1 = nn.Linear(16 * 5 * 5, 120)
-        self.fc2 = nn.Linear(120, 84)
-        self.fc3 = nn.Linear(84, 10)
-
-    def forward(self, x):
-        x = self.pool(F.relu(self.conv1(x)))
-        x = self.pool(F.relu(self.conv2(x)))
-        x = x.view(-1, 16 * 5 * 5)
-        x = F.relu(self.fc1(x))
-        x = F.relu(self.fc2(x))
-        x = self.fc3(x)
-
-        return x
-
-
-transform = transforms.Compose(
-    [transforms.ToTensor(),
-     transforms.Normalize((0.5, 0.5, 0.5),  (0.5, 0.5, 0.5))])
-
-trainset = torchvision.datasets.CIFAR10(root="./data", train=True,
-                                        download=True, transform=transform)
-trainloader = torch.utils.data.DataLoader(trainset, batch_size=4,
-                                          shuffle=True, num_workers=2)
-
-testset = torchvision.datasets.CIFAR10(root="./data", train=False,
-                                       download=True, transform=transform)
-testloader = torch.utils.data.DataLoader(testset, batch_size=4,
-                                         shuffle=False, num_workers=2)
-
-classes = ('plane', 'car', 'bird', 'cat', 'deer', 'dog', 'frog', 'horse', 'ship', 'truck')
 
 
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 print(device)
 
-net = Net()
-net.to(device)
 
-criterion = nn.CrossEntropyLoss()
-optimizer = optim.SGD(net.parameters(), lr=0.001, momentum=0.9)
+SOBEL_X = torch.tensor([
+    [-1, 0, +1],
+    [-2, 0, +2],
+    [-1, 0, +1]
+], dtype=torch.float, device=device)
+SOBEL_Y = SOBEL_X.T.to(device)  # Transpose SOBEL_X
+CELL_IDENTITY = torch.tensor([
+    [0, 0, 0],
+    [0, 1, 0],
+    [0, 0, 0]
+], dtype=torch.float, device=device)
 
-for epoch in range(2):
-    total_loss = 0.0
-    for i, data in enumerate(trainloader):
-        inputs, labels = data[0].to(device), data[1].to(device)
-        optimizer.zero_grad()
 
-        outputs = net(inputs)
-        loss = criterion(outputs, labels)
-        loss.backward()
-        optimizer.step()
+WIDTH = 32
+HEIGHT = 32
+CHANNELS = 16
 
-        total_loss += loss.item()
-        if i % 2000 == 1999:
-            print("[%d, %5d] loss: %.3f" % (epoch + 1, i + 1, total_loss / 2000))
-            total_loss = 0.0
 
-print("Finished training")
+class GrowingNet(nn.Module):
+    def __init__(self):
+        super(GrowingNet, self).__init__()
 
-PATH = "./cifar_net.pth"
-torch.save(net.state_dict(), PATH)
+        # Input shape: [CHANNELS, WIDTH, HEIGHT]
+        self.perception_filters = torch.stack([
+            SOBEL_X,
+            SOBEL_Y,
+            CELL_IDENTITY
+        ]).to(device)
 
+        self.dense_128 = nn.Conv2d(CHANNELS * self.perception_filters.shape[0], out_channels=128, kernel_size=(1, 1)).cuda()
+        self.dense_16 = nn.Conv2d(128, out_channels=CHANNELS, kernel_size=(1, 1)).cuda()
+
+    def forward(self, state_grid):
+        perception_result_shape = (
+            state_grid.shape[0],  # Batch
+            CHANNELS * len(self.perception_filters),
+            WIDTH,
+            HEIGHT
+        )
+
+        perception_result = torch.empty(perception_result_shape, device=device)
+        for i, perception_filter in enumerate(self.perception_filters):
+            start = i * CHANNELS
+            end = (i + 1) * CHANNELS
+            perception_result[:, start:end, :, :] = self.perceive(state_grid, perception_filter)
+
+        dx = self.dense_128(perception_result)
+        dx = self.dense_16(dx)
+
+        x = self.stochastic_update(state_grid, dx)
+        x = self.alive_masking(state_grid)
+        return x
+
+    @staticmethod
+    def perceive(state_grid, kernel):
+        # Pytorch conv2d expects weights like (out_channels, in_channels/groups, kernelW, kernelH)
+        convolution = kernel.view(1, 1, *kernel.shape).repeat(1, CHANNELS, 1, 1)
+
+        result = F.conv2d(state_grid, weight=convolution, padding=1).cuda()
+        return result
+
+    @staticmethod
+    def stochastic_update(state_grid, ds_grid):
+        rand_mask = torch.randint(0, 1, (WIDTH, HEIGHT), device=device)
+        return state_grid + ds_grid * rand_mask
+
+    @staticmethod
+    def alive_masking(state_grid):
+        alive = F.max_pool2d(state_grid[:3, :, :], kernel_size=(3, 3), stride=1, padding=1).cuda() > 0.1
+        return state_grid * alive
+
+
+def main():
+    grid = torch.zeros((WIDTH, HEIGHT, CHANNELS))
+
+    net = GrowingNet()
+    net.to(device)
+
+    random = torch.randn(1, CHANNELS, WIDTH, HEIGHT, device=device)
+    net.forward(random)
+
+    criterion = nn.CrossEntropyLoss()
+    optimizer = optim.SGD(net.parameters(), lr=0.001, momentum=0.9)
+
+
+if __name__ == "__main__":
+    main()
